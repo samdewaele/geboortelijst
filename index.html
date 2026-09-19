@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Geboortelijst</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f6f3ef; color: #333; display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 16px; box-sizing: border-box; text-align: center; }
+  button { background: #343a40; color: #fff; border: 0; border-radius: 6px; padding: 12px 24px; font-size: 1rem; cursor: pointer; }
+</style>
+</head>
+<body>
+  <form id="f" method="post" action="https://geboortelijstjes.be/html/bambolino/indexgbl.php">
+    <input type="hidden" name="page" value="gbl_fvm_sel.php">
+    <input type="hidden" name="txtKND" value="Xy Of Xx De Waele">
+    <input type="hidden" name="txtLEVDAT" value="2026-10-22">
+    <p>Je wordt doorgestuurd naar de geboortelijst…</p>
+    <button type="submit">Open de geboortelijst</button>
+  </form>
+  <script>document.getElementById('f').submit();</script>
+</body>
+</html>
