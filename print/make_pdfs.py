@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,7 @@ from reportlab.pdfgen import canvas
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE / "source"
 FONTS = HERE / "fonts"
+ASSETS = HERE / "assets"
 OUT = HERE / "out"
 
 A4L = (297.0 * mm, 210.0 * mm)
@@ -284,54 +286,104 @@ def barcode(c: canvas.Canvas, x: float, y: float, w: float, h: float, seed: str,
     c.restoreState()
 
 
+# --------------------------------------------------------------------------- world map
+
+_ROBINSON_PLEN = [1.0000, 0.9986, 0.9954, 0.9900, 0.9822, 0.9730, 0.9600, 0.9427, 0.9216, 0.8962,
+                  0.8679, 0.8350, 0.7986, 0.7597, 0.7186, 0.6732, 0.6213, 0.5722, 0.5322]
+_ROBINSON_PDFE = [0.0000, 0.0620, 0.1240, 0.1860, 0.2480, 0.3100, 0.3720, 0.4340, 0.4958, 0.5571,
+                  0.6176, 0.6769, 0.7346, 0.7903, 0.8435, 0.8936, 0.9394, 0.9761, 1.0000]
+
+
+def _robinson(lon: float, lat: float) -> tuple[float, float]:
+    """Robinson projection, unit radius. Returns x in [-2.67, 2.67], y in [-1.35, 1.35]."""
+    a = abs(lat) / 5.0
+    i = min(int(a), 17)
+    f = a - i
+    plen = _ROBINSON_PLEN[i] + (_ROBINSON_PLEN[i + 1] - _ROBINSON_PLEN[i]) * f
+    pdfe = _ROBINSON_PDFE[i] + (_ROBINSON_PDFE[i + 1] - _ROBINSON_PDFE[i]) * f
+    x = 0.8487 * plen * lon * 3.141592653589793 / 180.0
+    y = 1.3523 * pdfe * (1 if lat >= 0 else -1)
+    return x, y
+
+
+def world_map(c: canvas.Canvas, cx: float, cy: float, width: float, color=RED_SOFT) -> None:
+    """Fill the continents (no Antarctica) centred at (cx, cy), `width` points wide."""
+    data = json.loads((ASSETS / "world.geo.json").read_text())
+    scale = width / (2 * 0.8487 * 3.141592653589793)
+    c.saveState()
+    c.setFillColorRGB(*color)
+    c.setStrokeColorRGB(*color)
+    c.setLineWidth(0.15)
+    c.setLineJoin(1)
+    for feat in data["features"]:
+        if feat["properties"].get("name") == "Antarctica":
+            continue
+        geom = feat["geometry"]
+        polys = [geom["coordinates"]] if geom["type"] == "Polygon" else geom["coordinates"]
+        for poly in polys:
+            ring = poly[0]              # outer ring only
+            if len(ring) < 4:
+                continue
+            p = c.beginPath()
+            for k, (lon, lat) in enumerate(ring):
+                x, y = _robinson(lon, lat)
+                X, Y = cx + x * scale, cy + y * scale
+                if k == 0:
+                    p.moveTo(X, Y)
+                else:
+                    p.lineTo(X, Y)
+            p.close()
+            c.drawPath(p, stroke=1, fill=1)
+    c.restoreState()
+
+
 # --------------------------------------------------------------------------- back designs
 
 def ticket_back(c: canvas.Canvas, x: float, y: float) -> None:
-    """Back of the boarding pass. (x, y) is the trim origin in points."""
+    """Back of the boarding pass: a quiet background, no repeated details.
+    (x, y) is the trim origin in points."""
     W, H = TICKET_W * mm, TICKET_H * mm
     stub_x = W * 1479.5 / 2000   # the perforation column on the front artwork
+    main_cx = (stub_x - 12 * mm) / 2 + 2 * mm   # centre of the main section, left of the circle
     c.saveState()
     c.translate(x, y)
-    # bleed fill + clip
     p = c.beginPath()
     p.rect(-BLEED, -BLEED, W + 2 * BLEED, H + 2 * BLEED)
     c.clipPath(p, stroke=0, fill=0)
     c.setFillColorRGB(*RED)
     c.rect(-BLEED, -BLEED, W + 2 * BLEED, H + 2 * BLEED, stroke=0, fill=1)
 
-    # faint large plane watermark across the main section
-    plane(c, 92 * mm, 30 * mm, 46 * mm, angle=12, color=RED_SOFT)
+    # faint world map across the whole ticket
+    world_map(c, W / 2 + 4 * mm, H / 2, 148 * mm)   # 148 mm wide = 75 mm tall, within the bleed
 
-    # header
-    plane(c, 14.5 * mm, 60.2 * mm, 3.2 * mm, angle=0)
-    text(c, 21 * mm, 58.8 * mm, "DE WAELE AIRLINES", "Poppins-Medium", 10.5, track=2.6)
-    text(c, 21 * mm, 54.3 * mm, "SMALL PASSENGER, BIG ADVENTURES", "Poppins", 6.2, track=1.5)
-    text(c, 150 * mm, 56.5 * mm, "Welcome to our greatest adventure!", "GreatVibes", 15, align="right")
-    c.setStrokeColorRGB(*GOLD)
-    c.setLineWidth(0.5)
-    c.line(10 * mm, 50.5 * mm, stub_x - 8 * mm, 50.5 * mm)
-
-    # route block
-    text(c, 12 * mm, 29.5 * mm, "GNT", "Bebas", 30, track=1.5)
-    text(c, 12 * mm, 25.5 * mm, "MARIA MIDDELARES, GENT", "Poppins", 5.6, track=1.2)
-    text(c, 12 * mm, 41.5 * mm, "FROM", "Poppins", 5.2, track=1.6, color=GOLD_SOFT)
-    text(c, stub_x - 10 * mm, 29.5 * mm, "HOME", "Bebas", 30, track=1.5, align="right")
-    text(c, stub_x - 10 * mm, 25.5 * mm, "HEERWEG-ZUID 231, 9052 GENT", "Poppins", 5.6, track=1.2, align="right")
-    text(c, stub_x - 10 * mm, 41.5 * mm, "TO", "Poppins", 5.2, track=1.6, align="right", color=GOLD_SOFT)
-    dotted_curve(c, [(48 * mm, 33 * mm), (66 * mm, 46 * mm), (92 * mm, 46 * mm), (108 * mm, 34 * mm)],
+    # sweeping flight path: heart at the left, dotted arc up to the plane circle
+    circle_c = (stub_x - 22 * mm, 35 * mm)
+    circle_r = 15 * mm
+    heart(c, 16 * mm, 16 * mm, 3.4 * mm)
+    dotted_curve(c, [(18.5 * mm, 17.5 * mm), (40 * mm, 60 * mm), (95 * mm, 62 * mm),
+                     (circle_c[0] - circle_r * 0.72, circle_c[1] + circle_r * 0.72)],
                  width=0.7, dash=(0.1, 2.0))
-    plane(c, 112 * mm, 32.3 * mm, 4.2 * mm, angle=-32)
-    heart(c, 46.5 * mm, 32.6 * mm, 3.6 * mm)
+    # thin solid sweep under the title, like a contrail
+    c.setStrokeColorRGB(*GOLD)
+    c.setLineWidth(0.35)
+    sp = c.beginPath()
+    sp.moveTo(-BLEED, 7 * mm)
+    sp.curveTo(60 * mm, 4 * mm, 100 * mm, 14 * mm, circle_c[0] - circle_r * 0.7, circle_c[1] - circle_r * 0.7)
+    c.drawPath(sp, stroke=1, fill=0)
 
-    # bottom fields
-    fields = [("FLIGHT", "DW 1010"), ("DATE", "10 OCT 2026"), ("BOARDING", "07:21 AM"),
-              ("SEAT", "1A"), ("CLASS", "FIRST OF MANY")]
-    fx = 12 * mm
-    for label, value in fields:
-        text(c, fx, 15.2 * mm, label, "Poppins", 5.0, track=1.5, color=GOLD_SOFT)
-        text(c, fx, 10.4 * mm, value, "Poppins-Medium", 7.2, track=1.0)
-        fx += max(tracked_width(value, "Poppins-Medium", 7.2, 1.0), 16 * mm) + 9 * mm
-    barcode(c, 12 * mm, 5.0 * mm, 44 * mm, 3.0 * mm, "DW1010-noriel")
+    # title
+    tx = 12 * mm + (circle_c[0] - circle_r - 12 * mm) / 2
+    text(c, tx, 37 * mm, "DE WAELE AIRLINES", "Poppins-Medium", 21, track=6.5, align="center")
+    text(c, tx, 29.5 * mm, "SMALL PASSENGER, BIG ADVENTURES", "Poppins", 7.6, track=3.2, align="center")
+
+    # plane in a circle
+    c.setFillColorRGB(*RED)
+    c.setStrokeColorRGB(*GOLD)
+    c.setLineWidth(0.9)
+    c.circle(circle_c[0], circle_c[1], circle_r, stroke=1, fill=1)
+    c.setLineWidth(0.3)
+    c.circle(circle_c[0], circle_c[1], circle_r - 1.8 * mm, stroke=1, fill=0)
+    plane(c, circle_c[0] + 0.3 * mm, circle_c[1], 8.6 * mm, angle=22)
 
     # perforation line (same place as on the front)
     c.setStrokeColorRGB(*GOLD)
@@ -341,14 +393,9 @@ def ticket_back(c: canvas.Canvas, x: float, y: float) -> None:
     c.line(stub_x, -BLEED, stub_x, H + BLEED)
     c.setDash()
 
-    # stub
+    # stub: just a heart on the map
     sx = (stub_x + W) / 2
-    text(c, sx, 56.5 * mm, "BOARDING PASS", "Bebas", 15, track=1.8, align="center")
-    text(c, sx, 50.5 * mm, "NORIËL DE WAELE", "Poppins-Medium", 7.4, track=1.6, align="center")
-    text(c, sx, 45.5 * mm, "10 · 10 · 2026   07:21 AM", "Poppins", 6.0, track=1.3, align="center")
-    barcode(c, sx - 21 * mm, 22 * mm, 42 * mm, 14 * mm, "DWA1010-NORIEL/DEWAELE")
-    text(c, sx, 17.2 * mm, "DWA1010  NORIEL/DEWAELE  10OCT26", "SpaceMono", 5.6, track=0.2, align="center")
-    heart(c, sx, 9.5 * mm, 4.4 * mm, fill=False)
+    heart(c, sx, 35 * mm, 9 * mm, fill=False)
     c.restoreState()
 
 
