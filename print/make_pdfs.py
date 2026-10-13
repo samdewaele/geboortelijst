@@ -359,8 +359,8 @@ def ticket_back(c: canvas.Canvas, x: float, y: float) -> None:
     # sweeping flight path: heart at the left, dotted arc up to the plane circle
     circle_c = (stub_x - 22 * mm, 35 * mm)
     circle_r = 15 * mm
-    heart(c, 16 * mm, 16 * mm, 3.4 * mm)
-    dotted_curve(c, [(18.5 * mm, 17.5 * mm), (40 * mm, 60 * mm), (95 * mm, 62 * mm),
+    heart(c, 13 * mm, 15.5 * mm, 3.4 * mm)
+    dotted_curve(c, [(14.3 * mm, 18 * mm), (10 * mm, 72 * mm), (85 * mm, 66 * mm),
                      (circle_c[0] - circle_r * 0.72, circle_c[1] + circle_r * 0.72)],
                  width=0.7, dash=(0.1, 2.0))
     # thin solid sweep under the title, like a contrail
@@ -372,9 +372,16 @@ def ticket_back(c: canvas.Canvas, x: float, y: float) -> None:
     c.drawPath(sp, stroke=1, fill=0)
 
     # title
-    tx = 12 * mm + (circle_c[0] - circle_r - 12 * mm) / 2
-    text(c, tx, 37 * mm, "DE WAELE AIRLINES", "Poppins-Medium", 21, track=6.5, align="center")
-    text(c, tx, 29.5 * mm, "SMALL PASSENGER, BIG ADVENTURES", "Poppins", 7.6, track=3.2, align="center")
+    usable = circle_c[0] - circle_r - 12 * mm - 6 * mm
+    tx = 13.5 * mm + (circle_c[0] - circle_r - 12 * mm) / 2
+    text(c, tx, 40 * mm, "DE WAELE AIRLINES", "Poppins-Medium", 21, track=6.5, align="center")
+    notes = ["Bezoekje? Heerweg-Zuid 231, Zwijnaarde. Graag een seintje vooraf: 0478 99 50 12",
+             "Geen zin in de QR-code? Je mag ook altijd een cadeautje overmaken naar BE55 7350 7478 2944"]
+    size = 7.4
+    while size > 5.0 and any(tracked_width(n, "Poppins", size, 0.5) > usable for n in notes):
+        size -= 0.1
+    text(c, tx, 32.5 * mm, notes[0], "Poppins", size, track=0.5, align="center")
+    text(c, tx, 32.5 * mm - size * 1.55, notes[1], "Poppins", size, track=0.5, align="center")
 
     # plane in a circle
     c.setFillColorRGB(*RED)
