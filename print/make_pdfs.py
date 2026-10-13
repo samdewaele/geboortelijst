@@ -1,168 +1,501 @@
 #!/usr/bin/env python3
-"""Build print-ready PDFs for the Noriël birth cards.
+"""Build the three A4 print sheets for the Noriël birth cards.
 
-Every card is a two-page PDF (one page per side). Each page is the trim size
-plus 3 mm bleed on every edge. The bleed is filled by extending the outer
-pixels of the design outward, so the artwork itself stays exactly at trim
-size and nothing in the design is lost when the printer cuts the card.
+All sheets are A4 landscape, two pages each (front, back) for duplex
+printing with FLIP ON LONG EDGE. `alt-short-edge-flip/` holds the same
+sheets prepared for flip-on-short-edge printers.
 
-PDF boxes are set so a print shop can read the trim size from the file:
-MediaBox = BleedBox = trim + bleed, TrimBox = ArtBox = trim.
+    1-passport.pdf   2 passports per sheet. Card 125 x 176 mm, folds at 88 mm
+                     to a 125 x 88 mm (88 x 125 upright) passport.
+                     Page 1 outside (2_2.png), page 2 inside (1_2.png).
+    2-ticket.pdf     2 boarding passes per sheet, 216.3 x 70 mm.
+                     Page 1 artwork (1_1.png), page 2 designed back.
+    3-tag.pdf        55 name tags per sheet, 50 x 16.2 mm, cut on shared lines.
+                     Page 1 artwork (1.png), page 2 designed back.
+
+Artwork is embedded losslessly at native resolution (no resampling) and
+drawn exactly at trim size; 3 mm bleed around every piece is filled by
+extending the artwork's edge pixels (or solid red for the tag).
 
 Usage:
-    python3 print/make_pdfs.py            # writes print/out/*.pdf
-    python3 print/make_pdfs.py --marks    # also writes print/out/cropmarks/*.pdf
-
-Edit TRIM_MM below if the print shop wants another size. The artwork is
-scaled to fill the trim box, so only the aspect ratio matters.
+    python3 print/make_pdfs.py
 """
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import io
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE / "source"
+FONTS = HERE / "fonts"
 OUT = HERE / "out"
 
-BLEED_MM = 3.0
-MARK_LEN_MM = 5.0   # crop mark length
-MARK_GAP_MM = 1.0   # gap between the bleed edge and the start of the mark
+A4L = (297.0 * mm, 210.0 * mm)
+BLEED = 3.0 * mm
+MARK_GAP = 1.0 * mm
+MARK_LEN = 5.0 * mm
 
-# Trim sizes in mm (width, height).
-TRIM_MM = {
-    # A5 landscape, folded once to A6 (105 x 148 mm). Outside: left half is
-    # the back cover (map), right half is the front cover (Belgian passport).
-    # Inside: left page is the invitation, right page is the passport data.
-    "passport": (210.0, 148.0),
-    # Same width as the open passport. Height follows the artwork ratio.
-    "boarding-pass": (210.0, 68.0),
-}
+# Colours sampled from the artwork.
+RED = (85 / 255, 13 / 255, 26 / 255)
+RED_SOFT = (99 / 255, 19 / 255, 33 / 255)    # faint watermark on red
+GOLD = (218 / 255, 170 / 255, 68 / 255)
+GOLD_SOFT = (232 / 255, 196 / 255, 120 / 255)
 
-# card name -> (trim key, [(side label, source file), ...])
-CARDS = {
-    "passport": ("passport", [("outside", "2_2.png"), ("inside", "1_2.png")]),
-    "boarding-pass": ("boarding-pass", [("front", "1_1.png"), ("back", "1.png")]),
-    # Alternatives, in case the plain red sides are the intended backs.
-    "boarding-pass-plain-back": ("boarding-pass", [("front", "1_1.png"), ("back", "2_1.png")]),
-    "name-strip": ("boarding-pass", [("front", "1.png"), ("back", "2.png")]),
-}
+# Trim sizes in mm.
+PASSPORT_W, PASSPORT_H = 125.0, 176.0        # unfolded, fold at 88 mm
+TICKET_W, TICKET_H = 216.3, 70.0
+TAG_W = 50.0
+TAG_H = 50.0 * 647 / 2000                    # 16.175, follows the artwork ratio
 
 
-def load_rgb(path: Path) -> Image.Image:
-    im = Image.open(path)
+# --------------------------------------------------------------------------- assets
+
+@dataclass
+class Asset:
+    reader: ImageReader
+    width: int      # un-padded pixel size
+    height: int
+    pad: int        # bleed padding in pixels (same on all sides)
+
+
+def load_asset(name: str, trim_w_mm: float, bleed_fill: tuple[int, int, int] | None = None) -> Asset:
+    """Load a PNG and pad it with bleed. The pad repeats the edge pixels unless
+    `bleed_fill` gives a solid colour. Pixels are never resampled."""
+    im = Image.open(SOURCE / name)
     im.load()
     if im.mode != "RGB":
         im = im.convert("RGB")
-    return im
-
-
-def add_bleed(im: Image.Image, trim_w_mm: float, bleed_mm: float) -> tuple[Image.Image, int]:
-    """Pad the image on all sides by `bleed_mm` worth of pixels, repeating edge pixels."""
-    px_per_mm = im.width / trim_w_mm
-    pad = int(round(bleed_mm * px_per_mm))
     arr = np.asarray(im)
-    padded = np.pad(arr, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
-    return Image.fromarray(padded), pad
+    pad = int(round(BLEED / mm * im.width / trim_w_mm))
+    if bleed_fill is None:
+        padded = np.pad(arr, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
+    else:
+        padded = np.empty((arr.shape[0] + 2 * pad, arr.shape[1] + 2 * pad, 3), dtype=arr.dtype)
+        padded[:, :] = np.array(bleed_fill, dtype=arr.dtype)
+        padded[pad:pad + arr.shape[0], pad:pad + arr.shape[1]] = arr
+    buf = io.BytesIO()
+    Image.fromarray(padded).save(buf, format="PNG", compress_level=6)
+    buf.seek(0)
+    return Asset(ImageReader(buf), im.width, im.height, pad)
 
 
-def draw_crop_marks(c: canvas.Canvas, ox: float, oy: float, tw: float, th: float, bleed: float) -> None:
-    """Draw crop marks around the trim rectangle (ox, oy, tw, th) in points."""
-    gap = bleed + MARK_GAP_MM * mm
-    length = MARK_LEN_MM * mm
+def place(c: canvas.Canvas, a: Asset, x: float, y: float, w: float, h: float, rot: int = 0) -> None:
+    """Draw the asset so its un-padded artwork fills the trim rect (x, y, w, h)
+    in points, rotated `rot` degrees counter-clockwise about the rect centre."""
     c.saveState()
-    c.setLineWidth(0.25)
-    c.setStrokeColorRGB(0, 0, 0)
-    for x in (ox, ox + tw):
-        c.line(x, oy - gap, x, oy - gap - length)              # bottom
-        c.line(x, oy + th + gap, x, oy + th + gap + length)    # top
-    for y in (oy, oy + th):
-        c.line(ox - gap, y, ox - gap - length, y)              # left
-        c.line(ox + tw + gap, y, ox + tw + gap + length, y)    # right
+    c.translate(x + w / 2, y + h / 2)
+    c.rotate(rot)
+    aw, ah = (h, w) if rot % 180 == 90 else (w, h)
+    sx, sy = aw / a.width, ah / a.height
+    px, py = a.pad * sx, a.pad * sy
+    c.drawImage(a.reader, -aw / 2 - px, -ah / 2 - py, width=aw + 2 * px, height=ah + 2 * py)
     c.restoreState()
 
 
-def build(card: str, marks: bool, out_dir: Path) -> Path:
-    trim_key, sides = CARDS[card]
-    trim_w_mm, trim_h_mm = TRIM_MM[trim_key]
-    tw, th = trim_w_mm * mm, trim_h_mm * mm
-    bleed = BLEED_MM * mm
-    slug = (MARK_GAP_MM + MARK_LEN_MM + 1.0) * mm if marks else 0.0
+# --------------------------------------------------------------------------- marks
 
-    page_w = tw + 2 * bleed + 2 * slug
-    page_h = th + 2 * bleed + 2 * slug
-    ox, oy = bleed + slug, bleed + slug  # trim origin on the page
+def _mark_style(c: canvas.Canvas) -> None:
+    c.setLineWidth(0.25)
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setDash()
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{card}.pdf"
-    c = canvas.Canvas(str(out_path), pagesize=(page_w, page_h))
-    c.setTitle(f"Noriël De Waele - {card}")
+
+def crop_marks(c: canvas.Canvas, x: float, y: float, w: float, h: float) -> None:
+    """Crop marks for a single piece with bleed around it."""
+    g = BLEED + MARK_GAP
+    c.saveState()
+    _mark_style(c)
+    for xx in (x, x + w):
+        c.line(xx, y - g, xx, y - g - MARK_LEN)
+        c.line(xx, y + h + g, xx, y + h + g + MARK_LEN)
+    for yy in (y, y + h):
+        c.line(x - g, yy, x - g - MARK_LEN, yy)
+        c.line(x + w + g, yy, x + w + g + MARK_LEN, yy)
+    c.restoreState()
+
+
+def fold_marks(c: canvas.Canvas, x: float, y_fold: float, w: float) -> None:
+    """Dashed fold marks left and right of a piece, at height y_fold."""
+    g = BLEED + MARK_GAP
+    c.saveState()
+    _mark_style(c)
+    c.setDash(1.5, 1.5)
+    c.line(x - g, y_fold, x - g - MARK_LEN, y_fold)
+    c.line(x + w + g, y_fold, x + w + g + MARK_LEN, y_fold)
+    c.restoreState()
+
+
+def grid_marks(c: canvas.Canvas, x: float, y: float, w: float, h: float, cols: int, rows: int) -> None:
+    """Crop marks for a block of butt-joined pieces: one mark per cut line on
+    each side of the block."""
+    g = BLEED + MARK_GAP
+    c.saveState()
+    _mark_style(c)
+    for i in range(cols + 1):
+        xx = x + i * w / cols
+        c.line(xx, y - g, xx, y - g - MARK_LEN)
+        c.line(xx, y + h + g, xx, y + h + g + MARK_LEN)
+    for j in range(rows + 1):
+        yy = y + j * h / rows
+        c.line(x - g, yy, x - g - MARK_LEN, yy)
+        c.line(x + w + g, yy, x + w + g + MARK_LEN, yy)
+    c.restoreState()
+
+
+def sheet_label(c: canvas.Canvas, text: str) -> None:
+    c.saveState()
+    c.setFont("Helvetica", 6)
+    c.setFillColorRGB(0, 0, 0)
+    c.drawString(8 * mm, 4 * mm, text)
+    c.restoreState()
+
+
+# --------------------------------------------------------------------------- vector art
+
+def register_fonts() -> None:
+    for name, file in [
+        ("Poppins", "Poppins-Regular.ttf"),
+        ("Poppins-Medium", "Poppins-Medium.ttf"),
+        ("Poppins-SemiBold", "Poppins-SemiBold.ttf"),
+        ("Bebas", "BebasNeue-Regular.ttf"),
+        ("SpaceMono", "SpaceMono-Regular.ttf"),
+        ("GreatVibes", "GreatVibes-Regular.ttf"),
+    ]:
+        pdfmetrics.registerFont(TTFont(name, str(FONTS / file)))
+
+
+def tracked_width(text: str, font: str, size: float, track: float) -> float:
+    return pdfmetrics.stringWidth(text, font, size) + track * max(len(text) - 1, 0)
+
+
+def text(c: canvas.Canvas, x: float, y: float, s: str, font: str, size: float,
+         track: float = 0.0, align: str = "left", color=GOLD) -> None:
+    w = tracked_width(s, font, size, track)
+    if align == "center":
+        x -= w / 2
+    elif align == "right":
+        x -= w
+    c.saveState()
+    c.setFillColorRGB(*color)
+    t = c.beginText(x, y)
+    t.setFont(font, size)
+    t.setCharSpace(track)
+    t.textOut(s)
+    c.drawText(t)
+    c.restoreState()
+
+
+_PLANE_PARTS = [
+    # fuselage (full outline, nose at +x)
+    [(1.0, 0.0), (0.93, 0.055), (0.6, 0.085), (0.0, 0.095), (-0.7, 0.075), (-0.96, 0.035), (-1.0, 0.0),
+     (-0.96, -0.035), (-0.7, -0.075), (0.0, -0.095), (0.6, -0.085), (0.93, -0.055)],
+    # wings
+    [(0.34, 0.06), (-0.36, 0.98), (-0.58, 0.98), (-0.12, 0.06)],
+    [(0.34, -0.06), (-0.36, -0.98), (-0.58, -0.98), (-0.12, -0.06)],
+    # tail planes
+    [(-0.72, 0.04), (-0.98, 0.42), (-1.1, 0.42), (-0.96, 0.04)],
+    [(-0.72, -0.04), (-0.98, -0.42), (-1.1, -0.42), (-0.96, -0.04)],
+]
+
+
+def plane(c: canvas.Canvas, x: float, y: float, half_len: float, angle: float = 0.0, color=GOLD) -> None:
+    """Top-down plane silhouette centred at (x, y), nose pointing +x rotated by `angle`."""
+    c.saveState()
+    c.translate(x, y)
+    c.rotate(angle)
+    c.scale(half_len, half_len)
+    c.setFillColorRGB(*color)
+    c.setStrokeColorRGB(*color)
+    c.setLineWidth(0.08)
+    c.setLineJoin(1)
+    for part in _PLANE_PARTS:
+        p = c.beginPath()
+        p.moveTo(*part[0])
+        for pt in part[1:]:
+            p.lineTo(*pt)
+        p.close()
+        c.drawPath(p, stroke=1, fill=1)
+    c.restoreState()
+
+
+def heart(c: canvas.Canvas, x: float, y: float, size: float, color=GOLD, fill: bool = True) -> None:
+    """Heart centred roughly at (x, y); `size` is its width."""
+    s = size / 2
+    c.saveState()
+    c.translate(x, y + 0.15 * size)
+    c.setFillColorRGB(*color)
+    c.setStrokeColorRGB(*color)
+    c.setLineWidth(max(size * 0.06, 0.3))
+    p = c.beginPath()
+    p.moveTo(0, -s * 0.95)
+    p.curveTo(-s * 1.15, -s * 0.2, -s * 1.05, s * 0.75, -s * 0.5, s * 0.75)
+    p.curveTo(-s * 0.2, s * 0.75, 0, s * 0.45, 0, s * 0.25)
+    p.curveTo(0, s * 0.45, s * 0.2, s * 0.75, s * 0.5, s * 0.75)
+    p.curveTo(s * 1.05, s * 0.75, s * 1.15, -s * 0.2, 0, -s * 0.95)
+    p.close()
+    c.drawPath(p, stroke=1, fill=1 if fill else 0)
+    c.restoreState()
+
+
+def dotted_curve(c: canvas.Canvas, pts, color=GOLD, width: float = 0.5, dash=(0.1, 1.6)) -> None:
+    """Round-dotted cubic bezier through control points ((x0,y0),(c1),(c2),(x1,y1))."""
+    (x0, y0), (x1, y1), (x2, y2), (x3, y3) = pts
+    c.saveState()
+    c.setStrokeColorRGB(*color)
+    c.setLineWidth(width)
+    c.setLineCap(1)
+    c.setDash(list(dash))
+    p = c.beginPath()
+    p.moveTo(x0, y0)
+    p.curveTo(x1, y1, x2, y2, x3, y3)
+    c.drawPath(p, stroke=1, fill=0)
+    c.restoreState()
+
+
+def barcode(c: canvas.Canvas, x: float, y: float, w: float, h: float, seed: str, color=GOLD) -> None:
+    """Decorative Code-128-looking bars, deterministic from `seed`."""
+    digest = hashlib.sha256(seed.encode()).digest() * 4
+    widths = []
+    for b in digest:
+        widths.append(1 + (b & 3))
+        widths.append(1 + ((b >> 2) & 3))
+    # start/stop guards
+    widths = [2, 1, 1, 2] + widths + [2, 3, 1, 1, 2]
+    unit = w / sum(widths)
+    c.saveState()
+    c.setFillColorRGB(*color)
+    cx = x
+    for i, wd in enumerate(widths):
+        if i % 2 == 0:
+            c.rect(cx, y, wd * unit, h, stroke=0, fill=1)
+        cx += wd * unit
+    c.restoreState()
+
+
+# --------------------------------------------------------------------------- back designs
+
+def ticket_back(c: canvas.Canvas, x: float, y: float) -> None:
+    """Back of the boarding pass. (x, y) is the trim origin in points."""
+    W, H = TICKET_W * mm, TICKET_H * mm
+    stub_x = W * 1479.5 / 2000   # the perforation column on the front artwork
+    c.saveState()
+    c.translate(x, y)
+    # bleed fill + clip
+    p = c.beginPath()
+    p.rect(-BLEED, -BLEED, W + 2 * BLEED, H + 2 * BLEED)
+    c.clipPath(p, stroke=0, fill=0)
+    c.setFillColorRGB(*RED)
+    c.rect(-BLEED, -BLEED, W + 2 * BLEED, H + 2 * BLEED, stroke=0, fill=1)
+
+    # faint large plane watermark across the main section
+    plane(c, 92 * mm, 30 * mm, 46 * mm, angle=12, color=RED_SOFT)
+
+    # header
+    plane(c, 14.5 * mm, 60.2 * mm, 3.2 * mm, angle=0)
+    text(c, 21 * mm, 58.8 * mm, "DE WAELE AIRLINES", "Poppins-Medium", 10.5, track=2.6)
+    text(c, 21 * mm, 54.3 * mm, "SMALL PASSENGER, BIG ADVENTURES", "Poppins", 6.2, track=1.5)
+    text(c, 150 * mm, 56.5 * mm, "Welcome to our greatest adventure!", "GreatVibes", 15, align="right")
+    c.setStrokeColorRGB(*GOLD)
+    c.setLineWidth(0.5)
+    c.line(10 * mm, 50.5 * mm, stub_x - 8 * mm, 50.5 * mm)
+
+    # route block
+    text(c, 12 * mm, 29.5 * mm, "GNT", "Bebas", 30, track=1.5)
+    text(c, 12 * mm, 25.5 * mm, "MARIA MIDDELARES, GENT", "Poppins", 5.6, track=1.2)
+    text(c, 12 * mm, 41.5 * mm, "FROM", "Poppins", 5.2, track=1.6, color=GOLD_SOFT)
+    text(c, stub_x - 10 * mm, 29.5 * mm, "HOME", "Bebas", 30, track=1.5, align="right")
+    text(c, stub_x - 10 * mm, 25.5 * mm, "HEERWEG-ZUID 231, 9052 GENT", "Poppins", 5.6, track=1.2, align="right")
+    text(c, stub_x - 10 * mm, 41.5 * mm, "TO", "Poppins", 5.2, track=1.6, align="right", color=GOLD_SOFT)
+    dotted_curve(c, [(48 * mm, 33 * mm), (66 * mm, 46 * mm), (92 * mm, 46 * mm), (108 * mm, 34 * mm)],
+                 width=0.7, dash=(0.1, 2.0))
+    plane(c, 112 * mm, 32.3 * mm, 4.2 * mm, angle=-32)
+    heart(c, 46.5 * mm, 32.6 * mm, 3.6 * mm)
+
+    # bottom fields
+    fields = [("FLIGHT", "DW 1010"), ("DATE", "10 OCT 2026"), ("BOARDING", "07:21 AM"),
+              ("SEAT", "1A"), ("CLASS", "FIRST OF MANY")]
+    fx = 12 * mm
+    for label, value in fields:
+        text(c, fx, 15.2 * mm, label, "Poppins", 5.0, track=1.5, color=GOLD_SOFT)
+        text(c, fx, 10.4 * mm, value, "Poppins-Medium", 7.2, track=1.0)
+        fx += max(tracked_width(value, "Poppins-Medium", 7.2, 1.0), 16 * mm) + 9 * mm
+    barcode(c, 12 * mm, 5.0 * mm, 44 * mm, 3.0 * mm, "DW1010-noriel")
+
+    # perforation line (same place as on the front)
+    c.setStrokeColorRGB(*GOLD)
+    c.setLineWidth(0.6)
+    c.setLineCap(1)
+    c.setDash([0.1, 2.2])
+    c.line(stub_x, -BLEED, stub_x, H + BLEED)
+    c.setDash()
+
+    # stub
+    sx = (stub_x + W) / 2
+    text(c, sx, 56.5 * mm, "BOARDING PASS", "Bebas", 15, track=1.8, align="center")
+    text(c, sx, 50.5 * mm, "NORIËL DE WAELE", "Poppins-Medium", 7.4, track=1.6, align="center")
+    text(c, sx, 45.5 * mm, "10 · 10 · 2026   07:21 AM", "Poppins", 6.0, track=1.3, align="center")
+    barcode(c, sx - 21 * mm, 22 * mm, 42 * mm, 14 * mm, "DWA1010-NORIEL/DEWAELE")
+    text(c, sx, 17.2 * mm, "DWA1010  NORIEL/DEWAELE  10OCT26", "SpaceMono", 5.6, track=0.2, align="center")
+    heart(c, sx, 9.5 * mm, 4.4 * mm, fill=False)
+    c.restoreState()
+
+
+def tag_back(c: canvas.Canvas, x: float, y: float) -> None:
+    """Back of the name tag. Keeps 12.5 mm at both ends free for the hole."""
+    W, H = TAG_W * mm, TAG_H * mm
+    c.saveState()
+    c.translate(x, y)
+    c.setFillColorRGB(*RED)
+    c.rect(0, 0, W, H, stroke=0, fill=1)   # bleed is handled by the neighbours / block edge
+    cy = H / 2
+    heart(c, 15 * mm, cy - 0.3 * mm, 2.6 * mm)
+    dotted_curve(c, [(17.2 * mm, cy + 0.2 * mm), (21 * mm, cy + 4.2 * mm), (27 * mm, cy + 4.2 * mm),
+                     (30.6 * mm, cy + 1.2 * mm)], width=0.55, dash=(0.1, 1.5))
+    plane(c, 33.9 * mm, cy, 3.6 * mm, angle=-28)
+    c.restoreState()
+
+
+# --------------------------------------------------------------------------- sheets
+
+def new_canvas(path: Path, title: str, subject: str) -> canvas.Canvas:
+    c = canvas.Canvas(str(path), pagesize=A4L)
+    c.setTitle(title)
     c.setAuthor("De Waele")
-    c.setSubject(f"{trim_w_mm:g} x {trim_h_mm:g} mm + {BLEED_MM:g} mm bleed")
+    c.setSubject(subject)
+    c.setCreator("make_pdfs.py")
+    return c
 
-    for label, filename in sides:
-        im = load_rgb(SOURCE / filename)
-        padded, pad = add_bleed(im, trim_w_mm, BLEED_MM)
-        # Round-trip through PNG so reportlab embeds it losslessly.
-        buf = io.BytesIO()
-        padded.save(buf, format="PNG")
-        buf.seek(0)
-        reader = ImageReader(buf)
 
-        # Scale so the un-padded artwork lands exactly on the trim box. The
-        # horizontal and vertical scales differ by well under 1% for these
-        # sources, which is invisible and avoids cropping the design.
-        sx, sy = tw / im.width, th / im.height
-        c.drawImage(reader, ox - pad * sx, oy - pad * sy,
-                    width=padded.width * sx, height=padded.height * sy)
+def start_back_page(c: canvas.Canvas, short_edge: bool) -> None:
+    """For short-edge duplex the whole back page is rotated 180 degrees."""
+    if short_edge:
+        c.translate(A4L[0], A4L[1])
+        c.rotate(180)
 
-        if marks:
-            draw_crop_marks(c, ox, oy, tw, th, bleed)
-            c.saveState()
-            c.setFont("Helvetica", 6)
-            c.setFillColorRGB(0, 0, 0)
-            c.drawString(ox, page_h - (slug / 2),
-                         f"{card} / {label} / trim {trim_w_mm:g} x {trim_h_mm:g} mm / bleed {BLEED_MM:g} mm")
-            c.restoreState()
 
-        bx, by = ox - bleed, oy - bleed
-        c.setTrimBox((ox, oy, ox + tw, oy + th))
-        c.setArtBox((ox, oy, ox + tw, oy + th))
-        c.setBleedBox((bx, by, bx + tw + 2 * bleed, by + th + 2 * bleed))
+def build_passport(outside: Asset, inside: Asset, out_dir: Path, short_edge: bool) -> Path:
+    W, H = PASSPORT_W * mm, PASSPORT_H * mm
+    gap = 14 * mm
+    x0 = (A4L[0] - (2 * W + gap)) / 2
+    y0 = (A4L[1] - H) / 2
+    xs = [x0, x0 + W + gap]
+    path = out_dir / "1-passport.pdf"
+    c = new_canvas(path, "Noriël - passport", f"2-up, card {PASSPORT_W:g} x {PASSPORT_H:g} mm, fold at 88 mm, 3 mm bleed")
+    flip = "short" if short_edge else "long"
+    for page, (asset, side) in enumerate([(outside, "outside"), (inside, "inside")]):
+        c.saveState()
+        if page == 1:
+            start_back_page(c, short_edge)
+        for x in xs:
+            place(c, asset, x, y0, W, H, rot=90)
+            crop_marks(c, x, y0, W, H)
+            fold_marks(c, x, y0 + H / 2, W)
+        sheet_label(c, f"Noriël passport · {side} (page {page + 1}/2) · card {PASSPORT_W:g} x {PASSPORT_H:g} mm, "
+                       f"fold at 88 mm · 3 mm bleed · duplex, flip on {flip} edge")
+        c.restoreState()
         c.showPage()
-
     c.save()
-    return out_path
+    return path
 
 
-def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--marks", action="store_true", help="also write versions with crop marks")
-    ap.add_argument("--only", nargs="*", choices=sorted(CARDS), help="build only these cards")
-    args = ap.parse_args(argv)
+def build_ticket(front: Asset, out_dir: Path, short_edge: bool) -> Path:
+    W, H = TICKET_W * mm, TICKET_H * mm
+    gap = 14 * mm
+    x0 = (A4L[0] - W) / 2
+    y0 = (A4L[1] - (2 * H + gap)) / 2
+    ys = [y0, y0 + H + gap]
+    path = out_dir / "2-ticket.pdf"
+    c = new_canvas(path, "Noriël - boarding pass", f"2-up, ticket {TICKET_W:g} x {TICKET_H:g} mm, 3 mm bleed")
+    flip = "short" if short_edge else "long"
+    for page in (0, 1):
+        c.saveState()
+        if page == 1:
+            start_back_page(c, short_edge)
+        for y in ys:
+            if page == 0:
+                place(c, front, x0, y, W, H)
+            else:
+                ticket_back(c, x0, y)
+            crop_marks(c, x0, y, W, H)
+        sheet_label(c, f"Noriël boarding pass · {'front' if page == 0 else 'back'} (page {page + 1}/2) · "
+                       f"ticket {TICKET_W:g} x {TICKET_H:g} mm · 3 mm bleed · duplex, flip on {flip} edge")
+        c.restoreState()
+        c.showPage()
+    c.save()
+    return path
 
-    missing = [f for _, sides in CARDS.values() for _, f in sides if not (SOURCE / f).exists()]
+
+def build_tag(front: Asset, out_dir: Path, short_edge: bool) -> Path:
+    W, H = TAG_W * mm, TAG_H * mm
+    cols, rows = 5, 11
+    BW, BH = cols * W, rows * H
+    x0 = (A4L[0] - BW) / 2
+    y0 = (A4L[1] - BH) / 2
+    path = out_dir / "3-tag.pdf"
+    c = new_canvas(path, "Noriël - name tag", f"{cols * rows}-up, tag {TAG_W:g} x {TAG_H:.1f} mm, shared cut lines, 3 mm bleed")
+    flip = "short" if short_edge else "long"
+    for page in (0, 1):
+        c.saveState()
+        if page == 1:
+            start_back_page(c, short_edge)
+        # solid red under the whole block including bleed (the tag edges are plain red)
+        c.setFillColorRGB(*RED)
+        c.rect(x0 - BLEED, y0 - BLEED, BW + 2 * BLEED, BH + 2 * BLEED, stroke=0, fill=1)
+        for j in range(rows):
+            for i in range(cols):
+                x, y = x0 + i * W, y0 + j * H
+                if page == 0:
+                    # clip each tag to its own cell so neighbours never cover it
+                    c.saveState()
+                    p = c.beginPath()
+                    p.rect(x, y, W, H)
+                    c.clipPath(p, stroke=0, fill=0)
+                    place(c, front, x, y, W, H)
+                    c.restoreState()
+                else:
+                    tag_back(c, x, y)
+        grid_marks(c, x0, y0, BW, BH, cols, rows)
+        sheet_label(c, f"Noriël name tag · {'front' if page == 0 else 'back'} (page {page + 1}/2) · "
+                       f"tag {TAG_W:g} x {TAG_H:.1f} mm, {cols} x {rows} = {cols * rows} per sheet, cut on the shared lines · "
+                       f"duplex, flip on {flip} edge")
+        c.restoreState()
+        c.showPage()
+    c.save()
+    return path
+
+
+def main() -> int:
+    needed = ["2_2.png", "1_2.png", "1_1.png", "1.png"]
+    missing = [f for f in needed if not (SOURCE / f).exists()]
     if missing:
-        print(f"missing source images in {SOURCE}: {sorted(set(missing))}", file=sys.stderr)
+        print(f"missing source images in {SOURCE}: {missing}", file=sys.stderr)
         return 1
+    register_fonts()
+    outside = load_asset("2_2.png", PASSPORT_H)        # artwork width runs along the card height (rotated)
+    inside = load_asset("1_2.png", PASSPORT_H)
+    ticket = load_asset("1_1.png", TICKET_W)
+    tag = load_asset("1.png", TAG_W, bleed_fill=(85, 13, 26))
 
-    for card in (args.only or list(CARDS)):
-        p = build(card, marks=False, out_dir=OUT)
-        print(p.relative_to(HERE.parent))
-        if args.marks:
-            p = build(card, marks=True, out_dir=OUT / "cropmarks")
+    for short_edge, out_dir in [(False, OUT), (True, OUT / "alt-short-edge-flip")]:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for p in (build_passport(outside, inside, out_dir, short_edge),
+                  build_ticket(ticket, out_dir, short_edge),
+                  build_tag(tag, out_dir, short_edge)):
             print(p.relative_to(HERE.parent))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())
