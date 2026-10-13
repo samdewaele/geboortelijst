@@ -79,9 +79,17 @@ def load_asset(name: str, trim_w_mm: float, bleed_fill: tuple[int, int, int] | N
     im.load()
     if im.mode != "RGB":
         im = im.convert("RGB")
-    arr = np.asarray(im)
+    arr = np.array(im)
     pad = int(round(BLEED / mm * im.width / trim_w_mm))
     if bleed_fill is None:
+        # The exports carry a 1-2 px light anti-aliased rim on some edges.
+        # Replace that rim with the pixels just inside it so the edge
+        # extension does not smear it into a visible band.
+        rim = 2
+        arr[:rim] = arr[rim]
+        arr[-rim:] = arr[-rim - 1]
+        arr[:, :rim] = arr[:, rim:rim + 1]
+        arr[:, -rim:] = arr[:, -rim - 1:-rim]
         padded = np.pad(arr, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
     else:
         padded = np.empty((arr.shape[0] + 2 * pad, arr.shape[1] + 2 * pad, 3), dtype=arr.dtype)
